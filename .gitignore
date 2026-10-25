@@ -1,0 +1,27 @@
+# Python and local tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.log
+*.bak
+*.backup
+
+# Public-document corpora: keep on disk, never commit PDFs or source-derived data
+/data/iranfoia/
+/data/probe/
+/iranfoia_probe/
+/iranfoia_corpus/
+*.part
+
+# Local secrets
+.env
+.env.*
+!.env.example

@@ -189,6 +189,11 @@ class Crawler:
         self.files_seen: set[str] = set()
         self.hashes: set[str] = set()
         self.entries: list[dict[str, Any]] = []
+        self.ui_pages_scanned = 0
+        self.initial_file_count = 0
+        self.pdf_candidates_seen = 0
+        self.download_failures = 0
+        self.duplicate_count = 0
         self.last_request_time = 0.0
         self.last_network_activity: list[dict[str, str]] = []
         self.browser_downloads = []
@@ -201,10 +206,18 @@ class Crawler:
             return
         with manifest.open(encoding='utf-8-sig', newline='') as f:
             for row in csv.DictReader(f):
-                if (self.out / row.get('file', '')).is_file():
+                if not row.get('file', '').startswith('pdfs/'):
+                    continue
+                existing = self.out / row['file']
+                if existing.is_file() and existing.stat().st_size == int(row.get('size_bytes') or -1):
+                    # Verify the checksum on resume, not only the filename.
+                    if hashlib.sha256(existing.read_bytes()).hexdigest() != row.get('sha256', ''):
+                        LOG.warning('Ignoring modified PDF on resume: %s', existing)
+                        continue
                     self.entries.append(row)
                     self.files_seen.add(row.get('download_url', ''))
                     self.hashes.add(row.get('sha256', ''))
+        self.initial_file_count = len(self.entries)
         LOG.info('Resuming: %s existing validated-file records', len(self.entries))
 
     def _log(self, filename: str, item: dict):
@@ -212,10 +225,12 @@ class Crawler:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
     def _save_manifest(self):
-        with (self.out / 'manifest.csv').open('w', encoding='utf-8-sig', newline='') as f:
+        tmp_manifest = self.out / 'manifest.csv.tmp'
+        with tmp_manifest.open('w', encoding='utf-8-sig', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FIELDS)
             writer.writeheader()
             writer.writerows(self.entries)
+        tmp_manifest.replace(self.out / 'manifest.csv')
 
     def _throttle(self):
         wait = self.args.delay - (time.monotonic() - self.last_request_time)
@@ -258,6 +273,7 @@ class Crawler:
             if url not in self.files_seen:
                 self.files_seen.add(url)
                 self.pending_files.append(Candidate(url, source, title, text, via))
+                self.pdf_candidates_seen += 1
                 self._log('discovered.jsonl', {'url': url, 'source_page': source, 'context': text, 'kind': kind})
         elif kind == 'page' or self.args.scope == 'same-host':
             if url not in self.visited and url not in self.pending_pages:
@@ -291,18 +307,26 @@ class Crawler:
             return response
         raise RuntimeError('Too many redirects')
 
-    def _page_count(self, path: Path) -> int | str:
+    @staticmethod
+    def _validated_pdf_page_count(data: bytes) -> int:
+        """Accept only PDFs that are structurally readable, not just PDF-looking bytes."""
+        from pypdf import PdfReader
         try:
-            from pypdf import PdfReader
-            return len(PdfReader(str(path), strict=False).pages)
-        except Exception:
-            return ''
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            count = len(reader.pages)
+            if count < 1:
+                raise ValueError('Zero-page PDF')
+            return count
+        except Exception as exc:
+            raise ValueError(f'Unreadable/invalid PDF: {exc}') from exc
 
     def _store(self, data: bytes, item: Candidate, mime: str, name: str = '') -> bool:
         if not pdf_ok(data):
             raise ValueError(f'Not a valid PDF (%s bytes, mime=%s)' % (len(data), mime))
+        pages = self._validated_pdf_page_count(data)
         digest = hashlib.sha256(data).hexdigest()
         if digest in self.hashes:
+            self.duplicate_count += 1
             self._log('duplicates.jsonl', {'download_url': item.url, 'sha256': digest, 'source': item.source_page})
             return False
         fname = digest[:14] + '_' + safe_name(name or urlparse(item.url).path)
@@ -311,7 +335,7 @@ class Crawler:
         tmp.write_bytes(data)
         tmp.replace(target)
         row = {'file': str(target.relative_to(self.out)), 'sha256': digest,
-               'size_bytes': len(data), 'pages': self._page_count(target), 'mime_type': mime,
+               'size_bytes': len(data), 'pages': pages, 'mime_type': mime,
                'download_url': item.url, 'source_page': item.source_page,
                'source_title': item.source_title, 'anchor_text': item.anchor_text,
                'found_via': item.found_via, 'downloaded_utc': now()}
@@ -409,6 +433,7 @@ class Crawler:
                 item = Candidate(resp.url, source, '', '', 'browser_pdf_response')
                 self._store(raw, item, resp.headers.get('content-type', 'application/pdf'))
             except Exception as exc:
+                self.download_failures += 1
                 self._log('errors.jsonl', {'stage': 'browser_pdf_response', 'url': resp.url, 'error': str(exc)})
         while self.browser_downloads and len(self.entries) < self.args.max_files:
             download, source = self.browser_downloads.pop(0)
@@ -424,6 +449,7 @@ class Crawler:
                 item = Candidate(download.url, source, '', download.suggested_filename, 'browser_download')
                 self._store(path.read_bytes(), item, 'application/pdf', download.suggested_filename)
             except Exception as exc:
+                self.download_failures += 1
                 self._log('errors.jsonl', {'stage': 'browser_download', 'url': download.url, 'error': str(exc)})
             finally:
                 path.unlink(missing_ok=True)
@@ -463,6 +489,7 @@ class Crawler:
             pass
 
     def _browser_scan(self, page, label: str):
+        self.ui_pages_scanned += 1
         url = page.url
         html = page.content()
         self.feed_html(html, url, label)
@@ -552,7 +579,7 @@ class Crawler:
             page = context.new_page()
             self._capture_browser(page)
             try:
-                while self.pending_pages and len(self.visited) < self.args.max_pages and len(self.entries) < self.args.max_files:
+                while self.pending_pages and self.ui_pages_scanned < self.args.max_pages and len(self.entries) < self.args.max_files:
                     url = self.pending_pages.popleft()
                     if url in self.visited:
                         continue
@@ -573,6 +600,7 @@ class Crawler:
                         if response and ('application/pdf' in response.headers.get('content-type','') or PDF_RE.search(page.url)):
                             self.queue(page.url, url, '', '', 'browser_navigation')
                             self.visited.add(url)
+                            self.ui_pages_scanned += 1
                             continue
                         # No CAPTCHA/login bypass; if the site requires authentication, log evidence.
                         if re.search(r'(?i)(captcha required|access denied|verify you are human)', page.title()):
@@ -591,16 +619,30 @@ class Crawler:
                             pass
                         fingerprints: set[str] = set()
                         for n in range(self.args.max_ui_pages):
-                            if len(self.visited) + n >= self.args.max_pages:
+                            # Count rendered JS pagination states as pages, not just URL changes.
+                            if self.ui_pages_scanned >= self.args.max_pages:
                                 break
                             fingerprint = hashlib.sha256(page.content().encode()).hexdigest()
                             if fingerprint in fingerprints:
                                 break
                             fingerprints.add(fingerprint)
                             self._browser_scan(page, url + '#ui-' + str(n+1))
+                            # Process downloads before advancing pagination.
+                            self._drain_browser_downloads()
+                            self.drain_files()
+                            if len(self.entries) >= self.args.max_files:
+                                break
+                            before_click_url = page.url
+                            self._try_download_buttons(page)
+                            self._drain_browser_downloads()
+                            self.drain_files()
+                            if len(self.entries) >= self.args.max_files:
+                                break
+                            if page.url != before_click_url:
+                                self.queue(page.url, before_click_url, '', '', 'button_navigation')
+                                break
+                            self._throttle()
                             if not self._click_next(page):
-                                # This may be an HTML detail page with JS-only download controls.
-                                self._try_download_buttons(page)
                                 break
                         self._drain_browser_downloads()
                         self.drain_files()
@@ -642,6 +684,7 @@ class Crawler:
             try:
                 self._save_download(item)
             except Exception as exc:
+                self.download_failures += 1
                 LOG.warning('Download error %s: %s', item.url, exc)
                 self._log('errors.jsonl', {'stage': 'download', 'url': item.url,
                                            'source_page': item.source_page, 'error': str(exc)})
@@ -657,7 +700,13 @@ class Crawler:
         finally:
             self._save_manifest()
             report = {'start': self.base, 'mode': self.args.mode,
-                      'pages_visited': len(self.visited), 'pdfs_downloaded': len(self.entries),
+                      'pages_visited': len(self.visited),
+                      'rendered_pages_scanned': self.ui_pages_scanned,
+                      'new_pdfs_in_run': len(self.entries) - self.initial_file_count,
+                      'pdf_candidates_seen': self.pdf_candidates_seen,
+                      'pdfs_downloaded': len(self.entries),
+                      'duplicates_in_run': self.duplicate_count,
+                      'download_errors_in_run': self.download_failures,
                       'target': self.args.max_files, 'finished_utc': now()}
             (self.out / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
             LOG.info('SUMMARY: %s', report)
@@ -666,10 +715,10 @@ class Crawler:
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description='Crawl public organizational PDFs from IranFOIA')
     ap.add_argument('--start', default=DEFAULT_START)
-    ap.add_argument('--out', default='iranfoia_corpus')
+    ap.add_argument('--out', default='data/iranfoia')
     ap.add_argument('--mode', choices=('browser', 'static'), default='browser')
     ap.add_argument('--max-files', type=int, default=150)
-    ap.add_argument('--max-pages', type=int, default=350)
+    ap.add_argument('--max-pages', type=int, default=350, help='total rendered pages in browser mode (URL and JS pagination states)')
     ap.add_argument('--max-ui-pages', type=int, default=100, help='pagination clicks on a single JS listing')
     ap.add_argument('--scope', choices=('documents', 'same-host'), default='documents')
     ap.add_argument('--allow-host', action='append', default=[], help='explicitly allow an extra host for linked PDFs')
@@ -688,7 +737,7 @@ def main(argv=None):
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
-    if args.max_files < 1 or args.max_pages < 1 or args.delay < 0.5:
+    if args.max_files < 1 or args.max_pages < 1 or args.max_ui_pages < 1 or args.max_mb < 1 or args.delay < 0.5:
         sys.exit('max-files/pages must be >=1, delay must be >=0.5 seconds')
     try:
         Crawler(args).run()
